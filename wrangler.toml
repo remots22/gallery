@@ -1,0 +1,13 @@
+name = "github-gallery-worker"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# These are the secret env vars — set real values via:
+#   wrangler secret put GITHUB_TOKEN
+#   wrangler secret put GITHUB_OWNER
+#   wrangler secret put GITHUB_REPO
+#   wrangler secret put ALLOWED_ORIGIN
+#
+# Non-secret vars you can set here:
+[vars]
+GITHUB_BRANCH = "main"

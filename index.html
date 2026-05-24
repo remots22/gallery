@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>gallery</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: monospace; font-size: 12px; background: #fff; color: #000; }
+
+/* ── header ── */
+#bar { padding: 10px 14px; border-bottom: 1px solid #000; }
+#bar-top { display: flex; align-items: baseline; gap: 16px; }
+#bar h1 { font-size: 12px; font-weight: normal; }
+
+button {
+  font: inherit; background: none; border: none; cursor: pointer;
+  padding: 0; text-decoration: underline;
+}
+button:hover { opacity: 0.5; }
+button:disabled { opacity: 0.3; cursor: default; text-decoration: none; }
+
+/* ── nav ── */
+#nav { margin-top: 8px; display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+.nav-cat { cursor: pointer; }
+.nav-cat:hover { opacity: 0.5; }
+.nav-cat.active { font-weight: bold; text-decoration: none; }
+.nav-sep { color: #ccc; }
+.nav-year { cursor: pointer; color: #999; }
+.nav-year:hover { color: #000; }
+.nav-year.active { color: #000; font-weight: bold; }
+
+/* ── upload strip ── */
+#upload { display: none; padding: 10px 14px; border-bottom: 1px solid #eee; }
+#upload.open { display: block; }
+#upload label { cursor: pointer; text-decoration: underline; }
+#upload label:hover { opacity: 0.5; }
+#upload input[type=file] { display: none; }
+#upload-row { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+#chosen { color: #666; }
+#progress-wrap { margin-top: 6px; height: 1px; background: #eee; display: none; }
+#progress-fill { height: 1px; background: #000; width: 0%; transition: width 0.2s; }
+#upload-status { margin-top: 4px; color: #666; min-height: 14px; }
+
+/* ── grid ── */
+#grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 1px; background: #eee; padding: 1px;
+}
+
+.item { background: #fff; aspect-ratio: 1; overflow: hidden; cursor: pointer; }
+.item img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.item.non-image {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 6px; padding: 12px;
+  color: #666; text-align: center; word-break: break-all;
+}
+.item.non-image .label { font-size: 11px; }
+.item.non-image .tag { font-size: 10px; border: 1px solid #ccc; padding: 1px 5px; color: #999; }
+
+/* ── lightbox ── */
+#lb {
+  display: none; position: fixed; inset: 0; background: #fff;
+  z-index: 10; cursor: pointer; align-items: center; justify-content: center;
+}
+#lb.open { display: flex; }
+#lb img { max-width: 100%; max-height: 100%; object-fit: contain; display: none; }
+#lb-msg { color: #999; }
+
+/* ── misc ── */
+#msg { padding: 20px 14px; color: #999; display: none; }
+@media (max-width: 480px) { #grid { grid-template-columns: repeat(2, 1fr); } }
+</style>
+</head>
+<body>
+
+<div id="bar">
+  <div id="bar-top">
+    <h1>gallery</h1>
+    <button id="btn-upload">upload</button>
+    <button id="btn-cancel" style="display:none">cancel</button>
+  </div>
+  <div id="nav"></div>
+</div>
+
+<div id="upload">
+  <div id="upload-row">
+    <label for="file-input">choose file</label>
+    <input type="file" id="file-input" accept="image/*,video/*,.pdf,.zip,.txt,.md" />
+    <span id="chosen"></span>
+    <button id="btn-submit" disabled>send</button>
+  </div>
+  <div id="progress-wrap"><div id="progress-fill"></div></div>
+  <div id="upload-status"></div>
+</div>
+
+<div id="lb">
+  <img id="lb-img" alt="" />
+  <span id="lb-msg"></span>
+</div>
+
+<div id="msg"></div>
+<div id="grid" style="display:none"></div>
+
+<script>
+// ── config ────────────────────────────────────────────────────────────────
+const WORKER_URL = 'https://YOUR_WORKER.YOUR_SUBDOMAIN.workers.dev';
+const OWNER      = 'remots22';
+const REPO       = 'gallery';
+const BRANCH     = 'main';
+
+const RAW_BASE   = `https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/`;
+const API_TREE   = `https://api.github.com/repos/${OWNER}/${REPO}/git/trees/${BRANCH}?recursive=1`;
+const HASHES_URL = RAW_BASE + 'hashes.json';
+// ─────────────────────────────────────────────────────────────────────────
+
+const CHUNK_SIZE   = 24 * 1024 * 1024;
+const COMPRESSIBLE = new Set(['image/jpeg','image/png','image/webp','image/avif','image/bmp']);
+const IMAGE_EXTS   = new Set(['jpg','jpeg','png','gif','webp','avif','svg','bmp']);
+const VIDEO_EXTS   = new Set(['mp4','mov','webm','avi','mkv','m4v']);
+const CATEGORIES   = ['pildid','videod','muu'];
+const HASH_THRESH  = 12; // Hamming distance — below this = duplicate
+
+const $ = id => document.getElementById(id);
+function ext(name)  { return (name.split('.').pop() || '').toLowerCase(); }
+function isImg(n)   { return IMAGE_EXTS.has(ext(n)); }
+function fmtSize(b) { return b < 1048576 ? (b/1024).toFixed(0)+'k' : (b/1048576).toFixed(1)+'M'; }
+function esc(s)     { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function sanitize(n){ return n.replace(/[/\\]/g,'').replace(/\s+/g,'_').replace(/[^a-zA-Z0-9._\-]/g,'').slice(0,180)||'upload'; }
+
+// ── state ─────────────────────────────────────────────────────────────────
+let allFiles   = [];   // {path, category, year, name}
+let activeCat  = 'pildid';
+let activeYear = 'all';
+
+// ── gallery load ──────────────────────────────────────────────────────────
+async function loadGallery() {
+  showMsg('loading…');
+  try {
+    const r = await fetch(API_TREE, { headers: { Accept: 'application/vnd.github.v3+json' } });
+    if (!r.ok) throw 0;
+    const { tree } = await r.json();
+
+    allFiles = tree
+      .filter(f => f.type === 'blob')
+      .map(f => {
+        const parts    = f.path.split('/');
+        const category = CATEGORIES.includes(parts[0]) ? parts[0] : null;
+        const year     = parts.length >= 3 ? parts[1] : null;
+        const name     = parts[parts.length - 1];
+        return { path: f.path, category, year, name };
+      })
+      .filter(f =>
+        f.category &&
+        f.year &&
+        !f.name.endsWith('.manifest') &&
+        !/\.part\d+$/.test(f.name) &&
+        f.name !== '.gitkeep' &&
+        f.name !== 'hashes.json'
+      );
+
+    buildNav();
+    renderGrid();
+  } catch {
+    showMsg('failed to load.');
+  }
+}
+
+function buildNav() {
+  const nav = $('nav');
+  nav.innerHTML = '';
+
+  CATEGORIES.forEach((cat, i) => {
+    if (i > 0) nav.appendChild(Object.assign(document.createElement('span'), { className:'nav-sep', textContent:'·' }));
+    const el = Object.assign(document.createElement('span'), { className:'nav-cat', textContent: cat });
+    if (cat === activeCat) el.classList.add('active');
+    el.onclick = () => { activeCat = cat; activeYear = 'all'; buildNav(); renderGrid(); };
+    nav.appendChild(el);
+  });
+
+  // Years for active category
+  const years = [...new Set(allFiles.filter(f => f.category === activeCat).map(f => f.year))]
+    .sort((a,b) => b - a);
+
+  if (years.length > 1) {
+    nav.appendChild(Object.assign(document.createElement('span'), { className:'nav-sep', textContent:'|' }));
+    ['all', ...years].forEach(y => {
+      const el = Object.assign(document.createElement('span'), { className:'nav-year', textContent: y });
+      if (y === activeYear) el.classList.add('active');
+      el.onclick = () => { activeYear = y; buildNav(); renderGrid(); };
+      nav.appendChild(el);
+    });
+  }
+}
+
+function renderGrid() {
+  let files = allFiles.filter(f => f.category === activeCat);
+  if (activeYear !== 'all') files = files.filter(f => f.year === activeYear);
+
+  // newest year first, then alphabetical by name within year
+  files.sort((a,b) => (b.year !== a.year ? b.year.localeCompare(a.year) : a.name.localeCompare(b.name)));
+
+  const grid = $('grid');
+  if (!files.length) { grid.style.display = 'none'; showMsg('nothing here yet.'); return; }
+
+  $('msg').style.display = 'none';
+  grid.style.display = 'grid';
+  grid.innerHTML = '';
+  files.forEach(f => grid.appendChild(makeItem(f)));
+}
+
+function makeItem(f) {
+  const el  = document.createElement('div');
+  const url = RAW_BASE + f.path;
+  el.className = 'item';
+
+  if (isImg(f.name)) {
+    el.innerHTML = `<img src="${url}" loading="lazy" alt="${esc(f.name)}" />`;
+    el.onclick   = () => openLb(url, f.name);
+  } else {
+    el.className += ' non-image';
+    el.innerHTML = `<span class="label">${esc(f.name)}</span>`;
+    el.onclick   = () => open(url, '_blank');
+  }
+  return el;
+}
+
+function showMsg(t) { const m = $('msg'); m.textContent = t; m.style.display = ''; $('grid').style.display = 'none'; }
+
+// ── lightbox ──────────────────────────────────────────────────────────────
+function openLb(src, caption) {
+  $('lb-img').src = src; $('lb-img').style.display = ''; $('lb-msg').textContent = '';
+  $('lb').classList.add('open');
+}
+$('lb').onclick = () => { $('lb').classList.remove('open'); $('lb-img').src = ''; };
+document.addEventListener('keydown', e => { if (e.key === 'Escape') $('lb').onclick(); });
+
+// ── dedup: difference hash (dHash) ────────────────────────────────────────
+// Returns a 16-char hex string (64-bit hash) for any image file.
+function dhash(imgEl, size = 8) {
+  const c = document.createElement('canvas');
+  c.width = size + 1; c.height = size;
+  c.getContext('2d').drawImage(imgEl, 0, 0, size + 1, size);
+  const px = c.getContext('2d').getImageData(0, 0, size + 1, size).data;
+  let bits = 0n;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = (y * (size + 1) + x) * 4;
+      const g1 = 0.299*px[i]   + 0.587*px[i+1]   + 0.114*px[i+2];
+      const g2 = 0.299*px[i+4] + 0.587*px[i+5]   + 0.114*px[i+6];
+      bits = (bits << 1n) | (g1 > g2 ? 1n : 0n);
+    }
+  }
+  return bits.toString(16).padStart(16, '0');
+}
+
+function hammingDist(h1, h2) {
+  let x = BigInt('0x' + h1) ^ BigInt('0x' + h2), n = 0;
+  while (x > 0n) { if (x & 1n) n++; x >>= 1n; }
+  return n;
+}
+
+async function computeHash(file) {
+  if (!COMPRESSIBLE.has(file.type) && file.type !== 'image/jpeg') return null;
+  return new Promise(resolve => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => { URL.revokeObjectURL(url); resolve(dhash(img)); };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+    img.src = url;
+  });
+}
+
+// Extract year from EXIF (JPEG only, reads raw bytes)
+async function exifYear(file) {
+  if (!file.type.startsWith('image/jpeg') && !file.name.toLowerCase().endsWith('.jpg')) return null;
+  try {
+    const buf  = await file.slice(0, 131072).arrayBuffer();
+    const view = new DataView(buf);
+    if (view.getUint16(0) !== 0xFFD8) return null;
+    let off = 2;
+    while (off < buf.byteLength - 4) {
+      const marker = view.getUint16(off);
+      if (marker === 0xFFE1) {
+        // APP1 — check for Exif header
+        if (view.getUint32(off + 4) === 0x45786966) { // "Exif"
+          const tiffOff = off + 10;
+          const le      = view.getUint16(tiffOff) === 0x4949;
+          const rd16    = (o) => le ? view.getUint16(tiffOff + o, true) : view.getUint16(tiffOff + o);
+          const rd32    = (o) => le ? view.getUint32(tiffOff + o, true) : view.getUint32(tiffOff + o);
+          const ifd0    = rd32(4);
+          const count   = rd16(ifd0);
+          for (let i = 0; i < count; i++) {
+            const tag = rd16(ifd0 + 2 + i * 12);
+            if (tag === 0x8769) { // ExifIFD pointer
+              const exifOff = rd32(ifd0 + 2 + i * 12 + 8);
+              const cnt2    = rd16(exifOff);
+              for (let j = 0; j < cnt2; j++) {
+                const t = rd16(exifOff + 2 + j * 12);
+                if (t === 0x9003 || t === 0x9004) { // DateTimeOriginal / Digitized
+                  const dataOff = rd32(exifOff + 2 + j * 12 + 8);
+                  const dec = new TextDecoder();
+                  const str = dec.decode(new Uint8Array(buf, tiffOff + dataOff, 4));
+                  const y = parseInt(str);
+                  if (y > 1990 && y < 2100) return y;
+                }
+              }
+            }
+          }
+        }
+        break;
+      }
+      if ((marker & 0xFF00) !== 0xFF00) break;
+      off += 2 + view.getUint16(off + 2);
+    }
+  } catch {}
+  return null;
+}
+
+let hashCache = null; // fetched once
+async function getHashes() {
+  if (hashCache !== null) return hashCache;
+  try {
+    const r = await fetch(HASHES_URL + '?t=' + Date.now());
+    hashCache = r.ok ? await r.json() : {};
+  } catch { hashCache = {}; }
+  return hashCache;
+}
+
+// Returns null (no dup) or {path, date, action} where action is 'skip' or 'replace'
+async function checkDuplicate(file, newHash) {
+  if (!newHash) return null;
+  const hashes = await getHashes();
+  for (const [hash, entry] of Object.entries(hashes)) {
+    if (hammingDist(hash, newHash) < HASH_THRESH) {
+      // Dates: entry.date is ISO string, compare with file's EXIF or lastModified
+      const existingDate = new Date(entry.date);
+      const newYear  = await exifYear(file);
+      const newDate  = newYear
+        ? new Date(newYear, 0, 1)
+        : new Date(file.lastModified);
+
+      if (newDate < existingDate) {
+        return { entry, action: 'replace' }; // new file is older → replace
+      } else {
+        return { entry, action: 'skip' };    // existing is older or equal → skip
+      }
+    }
+  }
+  return null;
+}
+
+// ── compress ──────────────────────────────────────────────────────────────
+function compressImage(file) {
+  if (!COMPRESSIBLE.has(file.type)) return Promise.resolve(file);
+  return new Promise(resolve => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const MAX = 4000;
+      let { width: w, height: h } = img;
+      if (w > MAX || h > MAX) { const s = MAX/Math.max(w,h); w=w*s|0; h=h*s|0; }
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      c.getContext('2d').drawImage(img, 0, 0, w, h);
+      c.toBlob(
+        blob => resolve(new File([blob], file.name.replace(/\.[^.]+$/, '.jpg'), { type:'image/jpeg' })),
+        'image/jpeg', 0.9
+      );
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(file); };
+    img.src = url;
+  });
+}
+
+// ── classify & date ───────────────────────────────────────────────────────
+function classify(file) {
+  if (file.type.startsWith('image/') || IMAGE_EXTS.has(ext(file.name))) return 'pildid';
+  if (file.type.startsWith('video/') || VIDEO_EXTS.has(ext(file.name))) return 'videod';
+  return 'muu';
+}
+
+async function fileYear(file) {
+  const y = await exifYear(file);
+  if (y) return String(y);
+  return String(new Date(file.lastModified).getFullYear());
+}
+
+// ── upload pipeline ───────────────────────────────────────────────────────
+async function commit(file, category, year) {
+  const fd = new FormData();
+  fd.append('file', file, file.name);
+  fd.append('category', category);
+  fd.append('year', year);
+  const r = await fetch(WORKER_URL + '/upload', { method:'POST', body:fd });
+  if (!r.ok) throw new Error((await r.text()) || `http ${r.status}`);
+}
+
+async function upload(raw, onProg) {
+  const category = classify(raw);
+  const year     = await fileYear(raw);
+
+  // Dedup check for images (before compression, on the original)
+  if (category === 'pildid') {
+    onProg(3, 'checking for duplicates…');
+    const h   = await computeHash(raw);
+    const dup = await checkDuplicate(raw, h);
+    if (dup) {
+      if (dup.action === 'skip') {
+        throw new Error(`duplicate of ${dup.entry.name} — skipped.`);
+      }
+      // replace: fall through, upload will overwrite via the worker
+      onProg(8, `replacing older version of ${dup.entry.name}…`);
+    }
+  }
+
+  // Compress
+  let file = raw;
+  if (COMPRESSIBLE.has(raw.type)) {
+    onProg(10, 'compressing…');
+    file = await compressImage(raw);
+    const s = Math.round((1 - file.size/raw.size) * 100);
+    onProg(20, `${fmtSize(raw.size)} → ${fmtSize(file.size)}${s>0?` (−${s}%)`:''}  [${category}/${year}]`);
+  } else {
+    onProg(20, `${category}/${year}`);
+  }
+
+  const id   = String(Date.now());
+  const name = sanitize(file.name);
+
+  if (file.size <= CHUNK_SIZE) {
+    onProg(25, 'uploading…');
+    await commit(new File([file], `${id}_${name}`, { type:file.type }), category, year);
+    onProg(100, '');
+    hashCache = null; // invalidate so next upload re-fetches hashes
+    return;
+  }
+
+  // Multi-part
+  const n = Math.ceil(file.size / CHUNK_SIZE);
+  const manifest = JSON.stringify({ v:1, id, name, type:file.type||'application/octet-stream', size:file.size, chunks:n });
+  onProg(22, `splitting into ${n} parts…`);
+  await commit(new File([manifest], `${id}_${name}.manifest`, { type:'application/json' }), category, year);
+  for (let i = 0; i < n; i++) {
+    const start = i * CHUNK_SIZE;
+    onProg(25 + (i/n*70)|0, `part ${i+1}/${n}  (${fmtSize(Math.min(start+CHUNK_SIZE,file.size))} / ${fmtSize(file.size)})`);
+    await commit(new File([file.slice(start, start+CHUNK_SIZE)], `${id}_${name}.part${i}`, { type:'application/octet-stream' }), category, year);
+  }
+  onProg(100, '');
+  hashCache = null;
+}
+
+// ── upload UI ─────────────────────────────────────────────────────────────
+let selectedFile = null;
+
+$('btn-upload').onclick = () => { $('upload').classList.add('open'); $('btn-upload').style.display='none'; $('btn-cancel').style.display=''; };
+$('btn-cancel').onclick = resetUpload;
+$('file-input').onchange = () => {
+  const f = $('file-input').files[0]; if (!f) return;
+  selectedFile = f;
+  $('chosen').textContent = `${f.name} (${fmtSize(f.size)})`;
+  $('btn-submit').disabled = false;
+  $('upload-status').textContent = '';
+};
+
+$('btn-submit').onclick = async () => {
+  if (!selectedFile) return;
+  $('btn-submit').disabled = true;
+  $('progress-wrap').style.display = 'block';
+  $('progress-fill').style.width = '0%';
+  try {
+    await upload(selectedFile, (pct, label) => {
+      $('progress-fill').style.width = pct + '%';
+      if (label) $('upload-status').textContent = label;
+    });
+    $('upload-status').textContent = 'done.';
+    setTimeout(() => { loadGallery(); resetUpload(); }, 1800);
+  } catch(e) {
+    $('upload-status').textContent = e.message;
+    $('btn-submit').disabled = false;
+  }
+};
+
+function resetUpload() {
+  $('upload').classList.remove('open');
+  $('btn-upload').style.display = ''; $('btn-cancel').style.display = 'none';
+  $('file-input').value = ''; $('chosen').textContent = '';
+  $('btn-submit').disabled = true;
+  $('progress-wrap').style.display = 'none';
+  $('progress-fill').style.width = '0%';
+  $('upload-status').textContent = '';
+  selectedFile = null;
+}
+
+// ── init ──────────────────────────────────────────────────────────────────
+loadGallery();
+</script>
+</body>
+</html>
